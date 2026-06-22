@@ -1,0 +1,666 @@
+{
+  "name": "Financial Document Processing Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "document-intake",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-intake",
+      "name": "Document Intake Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [240, 200],
+      "webhookId": "doc-intake-001",
+      "notes": "Entry point — receives bank statements, onboarding forms, loan applications"
+    },
+    {
+      "parameters": {
+        "operation": "upload",
+        "bucket": "={{ $env.S3_RAW_BUCKET }}",
+        "fileName": "=raw/{{ $now.format('YYYY/MM/DD') }}/{{ $json.filename || $now.toMillis() }}.bin",
+        "binaryPropertyName": "data",
+        "options": {
+          "storageClass": "STANDARD",
+          "tags": {
+            "tag": [
+              { "key": "source", "value": "={{ $json.source || 'api' }}" },
+              { "key": "type", "value": "raw" },
+              { "key": "ingested_at", "value": "={{ $now.toISO() }}" }
+            ]
+          }
+        }
+      },
+      "id": "s3-raw-upload",
+      "name": "S3 Raw Landing Bucket",
+      "type": "n8n-nodes-base.awsS3",
+      "typeVersion": 1,
+      "position": [460, 200],
+      "credentials": { "aws": { "id": "aws-creds", "name": "AWS Credentials" } },
+      "notes": "Uploads raw document to S3 landing zone"
+    },
+    {
+      "parameters": {
+        "operation": "sendMessage",
+        "queue": "={{ $env.SQS_QUEUE_URL }}",
+        "sendInputData": false,
+        "messageBody": "={\n  \"s3_key\": \"{{ $json.key }}\",\n  \"s3_bucket\": \"{{ $env.S3_RAW_BUCKET }}\",\n  \"filename\": \"{{ $json.filename }}\",\n  \"submitted_at\": \"{{ $now.toISO() }}\",\n  \"correlation_id\": \"{{ $json.correlation_id || $now.toMillis() }}\"\n}",
+        "options": {
+          "messageGroupId": "document-processing",
+          "messageDeduplicationId": "={{ $json.correlation_id || $now.toMillis() }}"
+        }
+      },
+      "id": "sqs-queue",
+      "name": "SQS Queue",
+      "type": "n8n-nodes-base.awsSqs",
+      "typeVersion": 1,
+      "position": [680, 200],
+      "credentials": { "aws": { "id": "aws-creds", "name": "AWS Credentials" } },
+      "notes": "Enqueues the S3 key for async processing"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Lambda Orchestrator: reads SQS message, fetches doc from S3, routes to classifier\nconst items = [];\nfor (const item of $input.all()) {\n  const body = typeof item.json.body === 'string' ? JSON.parse(item.json.body) : item.json.body;\n  items.push({\n    json: {\n      s3_key: body.s3_key,\n      s3_bucket: body.s3_bucket,\n      filename: body.filename,\n      correlation_id: body.correlation_id,\n      submitted_at: body.submitted_at,\n      orchestrated_at: new Date().toISOString()\n    }\n  });\n}\nreturn items;"
+      },
+      "id": "lambda-orchestrator",
+      "name": "Lambda Orchestrator",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 200],
+      "notes": "Parses SQS messages, prepares document context for agent pipeline"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.BEDROCK_ENDPOINT || 'https://bedrock-runtime.' + $env.AWS_REGION + '.amazonaws.com/model/anthropic.claude-3-sonnet-20240229-v1:0/invoke' }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "aws",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "body",
+              "value": "={\n  \"anthropic_version\": \"bedrock-2023-05-31\",\n  \"max_tokens\": 512,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"You are a document classifier for a financial institution. Classify the following document into exactly one of: BANK_STATEMENT, ONBOARDING_FORM, LOAN_APPLICATION, OTHER. Also provide a confidence score 0-1. Respond in JSON only: {\\\"document_type\\\": \\\"...\\\", \\\"confidence\\\": 0.0, \\\"reasoning\\\": \\\"...\\\"}. Document key: {{ $json.s3_key }}\"\n    }\n  ]\n}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "classifier-agent",
+      "name": "Classifier Agent — Document Type Detection",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1120, 200],
+      "credentials": { "aws": { "id": "aws-creds", "name": "AWS Credentials" } },
+      "notes": "Amazon Bedrock (Claude) classifies document type"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Parse classifier response and attach to context\nconst item = $input.first();\nlet classification;\ntry {\n  const content = item.json.body?.content || item.json.content;\n  const text = Array.isArray(content) ? content.find(b => b.type === 'text')?.text : content;\n  classification = JSON.parse(text.replace(/```json|```/g, '').trim());\n} catch(e) {\n  classification = { document_type: 'OTHER', confidence: 0.0, reasoning: 'Parse error: ' + e.message };\n}\nreturn [{\n  json: {\n    ...item.json,\n    classification\n  }\n}];"
+      },
+      "id": "parse-classification",
+      "name": "Parse Classification Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 200],
+      "notes": "Extracts document_type, confidence from LLM response"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.TEXTRACT_ENDPOINT || 'https://textract.' + $env.AWS_REGION + '.amazonaws.com' }}/",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "aws",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "body",
+              "value": "={\n  \"DocumentLocation\": {\n    \"S3Object\": {\n      \"Bucket\": \"{{ $json.s3_bucket }}\",\n      \"Name\": \"{{ $json.s3_key }}\"\n    }\n  },\n  \"FeatureTypes\": [\"TABLES\", \"FORMS\", \"SIGNATURES\"],\n  \"NotificationChannel\": {\n    \"SNSTopicArn\": \"{{ $env.TEXTRACT_SNS_ARN }}\",\n    \"RoleArn\": \"{{ $env.TEXTRACT_ROLE_ARN }}\"\n  }\n}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "extraction-agent-textract",
+      "name": "Extraction Agent — Textract",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1560, 200],
+      "credentials": { "aws": { "id": "aws-creds", "name": "AWS Credentials" } },
+      "notes": "AWS Textract: extracts text, tables, forms from document"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.COMPREHEND_ENDPOINT || 'https://comprehend.' + $env.AWS_REGION + '.amazonaws.com' }}/",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "aws",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "body",
+              "value": "={\n  \"Text\": \"{{ $json.textract_text?.substring(0, 4096) || '' }}\",\n  \"LanguageCode\": \"en\"\n}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "extraction-agent-ner",
+      "name": "Extraction Agent — Comprehend NER",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1780, 200],
+      "credentials": { "aws": { "id": "aws-creds", "name": "AWS Credentials" } },
+      "notes": "Amazon Comprehend: Named Entity Recognition (person, org, dates, amounts)"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Validation Agent: schema + confidence checks\nconst item = $input.first();\nconst { classification, textract_text, comprehend_entities } = item.json;\nconst confidence = classification?.confidence || 0;\nconst docType = classification?.document_type || 'OTHER';\n\nconst schemaChecks = {\n  BANK_STATEMENT: ['account_number', 'balance', 'transaction'],\n  LOAN_APPLICATION: ['applicant_name', 'loan_amount', 'income'],\n  ONBOARDING_FORM: ['name', 'address', 'id_number'],\n  OTHER: []\n};\n\nconst requiredFields = schemaChecks[docType] || [];\nconst missingFields = requiredFields.filter(f =>\n  !(textract_text || '').toLowerCase().includes(f.toLowerCase())\n);\n\nconst valid = missingFields.length === 0 && confidence >= 0.7;\nconst needsHITL = !valid || confidence < 0.7;\n\nreturn [{\n  json: {\n    ...item.json,\n    validation: {\n      valid,\n      needs_hitl: needsHITL,\n      missing_fields: missingFields,\n      confidence_gate_passed: confidence >= 0.7,\n      checked_at: new Date().toISOString()\n    }\n  }\n}];"
+      },
+      "id": "validation-agent",
+      "name": "Validation Agent — Schema & Confidence Checks",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2000, 200],
+      "notes": "Validates extracted data against schema; flags low-confidence for HITL"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "hitl-check",
+              "leftValue": "={{ $json.validation.needs_hitl }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "hitl-router",
+      "name": "Route: HITL or Proceed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2220, 200],
+      "notes": "Splits to HITL review queue or Routing Agent based on validation result"
+    },
+    {
+      "parameters": {
+        "operation": "sendMessage",
+        "queue": "={{ $env.HITL_QUEUE_URL }}",
+        "sendInputData": false,
+        "messageBody": "={\n  \"correlation_id\": \"{{ $json.correlation_id }}\",\n  \"s3_key\": \"{{ $json.s3_key }}\",\n  \"document_type\": \"{{ $json.classification.document_type }}\",\n  \"confidence\": {{ $json.classification.confidence }},\n  \"missing_fields\": {{ JSON.stringify($json.validation.missing_fields) }},\n  \"review_url\": \"{{ $env.HITL_DASHBOARD_URL }}/review/{{ $json.correlation_id }}\",\n  \"queued_at\": \"{{ $now.toISO() }}\"\n}",
+        "options": {}
+      },
+      "id": "hitl-review-queue",
+      "name": "HITL Review Queue — Human in the Loop",
+      "type": "n8n-nodes-base.awsSqs",
+      "typeVersion": 1,
+      "position": [2440, 80],
+      "credentials": { "aws": { "id": "aws-creds", "name": "AWS Credentials" } },
+      "notes": "Low-confidence or invalid docs sent to human review dashboard"
+    },
+    {
+      "parameters": {
+        "resumeUrl": "={{ $execution.resumeUrl }}",
+        "options": {
+          "responseData": "firstEntryJson",
+          "limitWaitTime": true,
+          "limitType": "afterTimeInterval",
+          "resumeAmount": 72,
+          "resumeUnit": "hours"
+        }
+      },
+      "id": "wait-hitl-approval",
+      "name": "Wait for Human Approval",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [2660, 80],
+      "webhookId": "hitl-resume-001",
+      "notes": "Pauses execution; resumes when reviewer approves via webhook callback"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Routing Agent: determines destination storage zone\nconst item = $input.first();\nconst docType = item.json.classification?.document_type || 'OTHER';\nconst confidence = item.json.classification?.confidence || 0;\n\nconst routingMap = {\n  BANK_STATEMENT:   { zone: 'bronze', downstream: ['aurora_rds', 'elasticsearch'], priority: 'standard' },\n  LOAN_APPLICATION: { zone: 'bronze', downstream: ['aurora_rds', 'redshift'], priority: 'high' },\n  ONBOARDING_FORM:  { zone: 'bronze', downstream: ['aurora_rds'], priority: 'standard' },\n  OTHER:            { zone: 'bronze', downstream: ['elasticsearch'], priority: 'low' }\n};\n\nconst routing = routingMap[docType] || routingMap.OTHER;\n\nreturn [{\n  json: {\n    ...item.json,\n    routing: {\n      ...routing,\n      routed_at: new Date().toISOString()\n    }\n  }\n}];"
+      },
+      "id": "routing-agent",
+      "name": "Routing Agent — Destination Selection",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2440, 320],
+      "notes": "Determines which data zone and downstream systems receive the document"
+    },
+    {
+      "parameters": {
+        "operation": "upload",
+        "bucket": "={{ $env.S3_BRONZE_BUCKET }}",
+        "fileName": "={{ $json.classification.document_type + '/' + $now.format('YYYY/MM/DD') + '/' + $json.correlation_id + '.json' }}",
+        "binaryPropertyName": "data",
+        "options": {
+          "storageClass": "STANDARD",
+          "tags": {
+            "tag": [
+              { "key": "zone", "value": "bronze" },
+              { "key": "doc_type", "value": "={{ $json.classification.document_type }}" }
+            ]
+          }
+        }
+      },
+      "id": "bronze-zone",
+      "name": "Bronze Zone — Raw Structured JSON",
+      "type": "n8n-nodes-base.awsS3",
+      "typeVersion": 1,
+      "position": [2660, 320],
+      "credentials": { "aws": { "id": "aws-creds", "name": "AWS Credentials" } },
+      "notes": "S3 Bronze: raw extracted JSON, no transformation"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Silver Zone: cleanse, deduplicate, normalise\nconst item = $input.first();\nconst raw = item.json;\n\n// Simulate deduplication hash\nconst crypto = require('crypto');\nconst contentHash = crypto.createHash('sha256')\n  .update(JSON.stringify(raw.classification) + raw.s3_key)\n  .digest('hex');\n\nconst silver = {\n  correlation_id: raw.correlation_id,\n  content_hash: contentHash,\n  document_type: raw.classification.document_type,\n  confidence: raw.classification.confidence,\n  entities: raw.comprehend_entities || [],\n  extracted_fields: raw.textract_fields || {},\n  routing: raw.routing,\n  processed_at: new Date().toISOString(),\n  zone: 'silver'\n};\n\nreturn [{ json: { ...raw, silver } }];"
+      },
+      "id": "silver-zone",
+      "name": "Silver Zone — Cleansed & Deduplicated",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2880, 320],
+      "notes": "Normalises fields, removes duplicates via content hash"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Gold Zone: business aggregates\nconst item = $input.first();\nconst silver = item.json.silver;\n\nconst gold = {\n  correlation_id: silver.correlation_id,\n  document_type: silver.document_type,\n  entity_summary: {\n    persons:       silver.entities.filter(e => e.Type === 'PERSON').map(e => e.Text),\n    organizations: silver.entities.filter(e => e.Type === 'ORGANIZATION').map(e => e.Text),\n    amounts:       silver.entities.filter(e => e.Type === 'QUANTITY').map(e => e.Text),\n    dates:         silver.entities.filter(e => e.Type === 'DATE').map(e => e.Text)\n  },\n  risk_indicators: {\n    high_value: silver.entities.some(e => e.Type === 'QUANTITY' && parseFloat(e.Text.replace(/[^0-9.]/g,'')) > 100000),\n    multiple_entities: silver.entities.filter(e => e.Type === 'PERSON').length > 3\n  },\n  aggregated_at: new Date().toISOString(),\n  zone: 'gold'\n};\n\nreturn [{ json: { ...item.json, gold } }];"
+      },
+      "id": "gold-zone",
+      "name": "Gold Zone — Business Aggregates",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3100, 320],
+      "notes": "Derives business-level aggregates: entity summaries, risk indicators"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=INSERT INTO documents (\n  correlation_id, document_type, confidence, entity_summary,\n  risk_high_value, risk_multi_entity, processed_at, s3_silver_key\n) VALUES (\n  '{{ $json.gold.correlation_id }}',\n  '{{ $json.gold.document_type }}',\n  {{ $json.silver.confidence }},\n  '{{ JSON.stringify($json.gold.entity_summary) }}'::jsonb,\n  {{ $json.gold.risk_indicators.high_value }},\n  {{ $json.gold.risk_indicators.multiple_entities }},\n  '{{ $json.gold.aggregated_at }}'::timestamptz,\n  '{{ $json.silver.correlation_id }}'\n)\nON CONFLICT (correlation_id) DO UPDATE SET\n  entity_summary = EXCLUDED.entity_summary,\n  processed_at = EXCLUDED.processed_at;",
+        "options": {}
+      },
+      "id": "aurora-rds",
+      "name": "Aurora RDS — Operational Store for Underwriters",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [3320, 200],
+      "credentials": { "postgres": { "id": "aurora-creds", "name": "Aurora RDS" } },
+      "notes": "Upserts gold-tier document record for underwriter portal queries"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=INSERT INTO dw_documents (\n  correlation_id, document_type, confidence, processed_date,\n  entity_count, has_high_value_flag\n)\nVALUES (\n  '{{ $json.gold.correlation_id }}',\n  '{{ $json.gold.document_type }}',\n  {{ $json.silver.confidence }},\n  CURRENT_DATE,\n  {{ ($json.gold.entity_summary.persons || []).length + ($json.gold.entity_summary.organizations || []).length }},\n  {{ $json.gold.risk_indicators.high_value }}\n)\nON CONFLICT DO NOTHING;",
+        "options": {}
+      },
+      "id": "redshift",
+      "name": "Redshift Serverless — BI & Executive Queries",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [3320, 400],
+      "credentials": { "postgres": { "id": "redshift-creds", "name": "Redshift Serverless" } },
+      "notes": "Writes aggregated metrics to Redshift for QuickSight dashboards"
+    },
+    {
+      "parameters": {
+        "operation": "index",
+        "index": "financial-documents",
+        "id": "={{ $json.gold.correlation_id }}",
+        "body": "={\n  \"document_type\": \"{{ $json.gold.document_type }}\",\n  \"confidence\": {{ $json.silver.confidence }},\n  \"entities\": {{ JSON.stringify($json.gold.entity_summary) }},\n  \"risk_indicators\": {{ JSON.stringify($json.gold.risk_indicators) }},\n  \"raw_text_excerpt\": \"{{ ($json.textract_text || '').substring(0, 500) }}\",\n  \"processed_at\": \"{{ $json.gold.aggregated_at }}\",\n  \"correlation_id\": \"{{ $json.gold.correlation_id }}\"\n}",
+        "options": {}
+      },
+      "id": "elasticsearch",
+      "name": "ElasticSearch — Full-Text Document Search",
+      "type": "n8n-nodes-base.elasticsearch",
+      "typeVersion": 1,
+      "position": [3320, 600],
+      "credentials": { "elasticsearch": { "id": "es-creds", "name": "ElasticSearch" } },
+      "notes": "Full-text index for underwriter portal search and compliance retrieval"
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "={{ $env.SAGEMAKER_FEATURE_STORE_ENDPOINT }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "aws",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "body",
+              "value": "={\n  \"FeatureGroupName\": \"{{ $env.FEATURE_GROUP_NAME || 'financial-documents-fg' }}\",\n  \"Record\": [\n    { \"FeatureName\": \"correlation_id\", \"ValueAsString\": \"{{ $json.gold.correlation_id }}\" },\n    { \"FeatureName\": \"document_type\", \"ValueAsString\": \"{{ $json.gold.document_type }}\" },\n    { \"FeatureName\": \"confidence\", \"ValueAsString\": \"{{ $json.silver.confidence }}\" },\n    { \"FeatureName\": \"entity_count\", \"ValueAsString\": \"{{ ($json.gold.entity_summary.persons || []).length }}\" },\n    { \"FeatureName\": \"high_value_flag\", \"ValueAsString\": \"{{ $json.gold.risk_indicators.high_value ? '1' : '0' }}\" },\n    { \"FeatureName\": \"event_time\", \"ValueAsString\": \"{{ $json.gold.aggregated_at }}\" }\n  ]\n}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "sagemaker-feature-store",
+      "name": "SageMaker Feature Store",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [3320, 800],
+      "credentials": { "aws": { "id": "aws-creds", "name": "AWS Credentials" } },
+      "notes": "Writes ML features to SageMaker Feature Store for training and inference"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SAGEMAKER_TRAINING_ENDPOINT }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "aws",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "body",
+              "value": "={\n  \"TrainingJobName\": \"churn-credit-recs-{{ $now.toMillis() }}\",\n  \"AlgorithmSpecification\": {\n    \"TrainingImage\": \"{{ $env.SAGEMAKER_TRAINING_IMAGE }}\",\n    \"TrainingInputMode\": \"File\"\n  },\n  \"RoleArn\": \"{{ $env.SAGEMAKER_ROLE_ARN }}\",\n  \"InputDataConfig\": [\n    {\n      \"ChannelName\": \"train\",\n      \"DataSource\": {\n        \"S3DataSource\": {\n          \"S3Uri\": \"s3://{{ $env.S3_GOLD_BUCKET }}/training-data/\"\n        }\n      }\n    }\n  ],\n  \"OutputDataConfig\": {\n    \"S3OutputPath\": \"s3://{{ $env.S3_GOLD_BUCKET }}/model-output/\"\n  },\n  \"ResourceConfig\": {\n    \"InstanceType\": \"ml.m5.large\",\n    \"InstanceCount\": 1,\n    \"VolumeSizeInGB\": 20\n  },\n  \"StoppingCondition\": { \"MaxRuntimeInSeconds\": 3600 }\n}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "training-pipeline",
+      "name": "Training Pipeline — Churn, Credit Risk, Recommendations",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [3540, 800],
+      "credentials": { "aws": { "id": "aws-creds", "name": "AWS Credentials" } },
+      "notes": "Triggers SageMaker training job for churn, credit risk, and recommendation models. Schedule-driven (weekly or on data volume threshold)."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SAGEMAKER_ENDPOINT }}/endpoints/{{ $env.INFERENCE_ENDPOINT_NAME }}/invocations",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "aws",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "body",
+              "value": "={\n  \"correlation_id\": \"{{ $json.gold.correlation_id }}\",\n  \"features\": {\n    \"document_type\": \"{{ $json.gold.document_type }}\",\n    \"confidence\": {{ $json.silver.confidence }},\n    \"high_value_flag\": {{ $json.gold.risk_indicators.high_value ? 1 : 0 }},\n    \"entity_count\": {{ ($json.gold.entity_summary.persons || []).length }}\n  }\n}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "inference-endpoints",
+      "name": "Inference Endpoints — A/B Deployed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [3760, 800],
+      "credentials": { "aws": { "id": "aws-creds", "name": "AWS Credentials" } },
+      "notes": "Calls A/B deployed SageMaker inference endpoints for real-time predictions"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.QUICKSIGHT_DATASET_REFRESH_URL || 'https://quicksight.' + $env.AWS_REGION + '.amazonaws.com/accounts/' + $env.AWS_ACCOUNT_ID + '/datasets/' + $env.QUICKSIGHT_DATASET_ID + '/refresh' }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "aws",
+        "options": {}
+      },
+      "id": "quicksight",
+      "name": "QuickSight — Executive Dashboards",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [3540, 200],
+      "credentials": { "aws": { "id": "aws-creds", "name": "AWS Credentials" } },
+      "notes": "Triggers QuickSight dataset refresh for executive BI dashboards"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.UNDERWRITER_PORTAL_NOTIFY_URL }}",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "body",
+              "value": "={\n  \"correlation_id\": \"{{ $json.gold.correlation_id }}\",\n  \"document_type\": \"{{ $json.gold.document_type }}\",\n  \"confidence\": {{ $json.silver.confidence }},\n  \"entity_summary\": {{ JSON.stringify($json.gold.entity_summary) }},\n  \"risk_flags\": {{ JSON.stringify($json.gold.risk_indicators) }},\n  \"review_url\": \"{{ $env.UNDERWRITER_PORTAL_URL }}/documents/{{ $json.gold.correlation_id }}\"\n}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "underwriter-portal",
+      "name": "Underwriter Portal — React + API Gateway",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [3540, 400],
+      "credentials": {},
+      "notes": "Notifies underwriter portal via API Gateway when a new document is ready for review"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.PERSONALISATION_ENGINE_URL }}",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "body",
+              "value": "={\n  \"correlation_id\": \"{{ $json.gold.correlation_id }}\",\n  \"predictions\": {{ JSON.stringify($json.inference_result || {}) }},\n  \"document_type\": \"{{ $json.gold.document_type }}\",\n  \"entity_summary\": {{ JSON.stringify($json.gold.entity_summary) }}\n}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "personalisation-engine",
+      "name": "Personalisation Engine — Product Recommendations",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [3540, 600],
+      "credentials": {},
+      "notes": "Sends ML inference results to personalisation engine for product recommendation delivery"
+    },
+    {
+      "parameters": {
+        "operation": "detectPiiEntities",
+        "text": "={{ $json.textract_text || '' }}",
+        "languageCode": "en"
+      },
+      "id": "macie-pii",
+      "name": "Macie — PII Detection",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1560, 600],
+      "notes": "AWS Macie scans extracted text for PII; redacts or flags before storage"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.KMS_ENDPOINT || 'https://kms.' + $env.AWS_REGION + '.amazonaws.com' }}/",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "aws",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "body",
+              "value": "={\n  \"KeyId\": \"{{ $env.KMS_KEY_ID }}\",\n  \"Plaintext\": \"{{ Buffer.from(JSON.stringify($json.silver || {})).toString('base64') }}\"\n}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "kms-encryption",
+      "name": "KMS — Field Encryption",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1780, 600],
+      "credentials": { "aws": { "id": "aws-creds", "name": "AWS Credentials" } },
+      "notes": "AWS KMS encrypts sensitive fields before they leave the processing pipeline"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CLOUDTRAIL_LOG_URL || 'https://logs.' + $env.AWS_REGION + '.amazonaws.com/log-events' }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "aws",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "body",
+              "value": "={\n  \"logGroupName\": \"/tradeos/document-pipeline\",\n  \"logStreamName\": \"{{ $now.format('YYYY/MM/DD') }}\",\n  \"logEvents\": [\n    {\n      \"timestamp\": {{ $now.toMillis() }},\n      \"message\": {{ JSON.stringify({\n        event: 'document_processed',\n        correlation_id: $json.gold?.correlation_id,\n        document_type: $json.gold?.document_type,\n        confidence: $json.silver?.confidence,\n        routing: $json.routing,\n        status: 'completed'\n      }) }}\n    }\n  ]\n}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "cloudtrail",
+      "name": "CloudTrail + GuardDuty Audit Log",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [2000, 600],
+      "credentials": { "aws": { "id": "aws-creds", "name": "AWS Credentials" } },
+      "notes": "Writes audit event to CloudWatch Logs; CloudTrail + GuardDuty picks it up for compliance"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"status\": \"accepted\",\n  \"correlation_id\": \"{{ $json.correlation_id }}\",\n  \"message\": \"Document submitted for processing\"\n}",
+        "options": { "responseCode": 202 }
+      },
+      "id": "response-accepted",
+      "name": "Respond 202 Accepted",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [460, 400],
+      "notes": "Returns 202 Accepted immediately; async processing continues in background"
+    },
+    {
+      "parameters": {
+        "errorMessage": "Document processing pipeline error",
+        "options": {}
+      },
+      "id": "error-handler",
+      "name": "Error Handler",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [240, 600],
+      "notes": "Catches pipeline errors, logs to CloudWatch, sends alert to ops channel"
+    }
+  ],
+  "connections": {
+    "Document Intake Webhook": {
+      "main": [
+        [
+          { "node": "S3 Raw Landing Bucket", "type": "main", "index": 0 },
+          { "node": "Respond 202 Accepted", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "S3 Raw Landing Bucket": {
+      "main": [[{ "node": "SQS Queue", "type": "main", "index": 0 }]]
+    },
+    "SQS Queue": {
+      "main": [[{ "node": "Lambda Orchestrator", "type": "main", "index": 0 }]]
+    },
+    "Lambda Orchestrator": {
+      "main": [[{ "node": "Classifier Agent — Document Type Detection", "type": "main", "index": 0 }]]
+    },
+    "Classifier Agent — Document Type Detection": {
+      "main": [[{ "node": "Parse Classification Result", "type": "main", "index": 0 }]]
+    },
+    "Parse Classification Result": {
+      "main": [[{ "node": "Extraction Agent — Textract", "type": "main", "index": 0 }]]
+    },
+    "Extraction Agent — Textract": {
+      "main": [[{ "node": "Extraction Agent — Comprehend NER", "type": "main", "index": 0 }]]
+    },
+    "Extraction Agent — Comprehend NER": {
+      "main": [[
+        { "node": "Validation Agent — Schema & Confidence Checks", "type": "main", "index": 0 },
+        { "node": "Macie — PII Detection", "type": "main", "index": 0 }
+      ]]
+    },
+    "Macie — PII Detection": {
+      "main": [[{ "node": "KMS — Field Encryption", "type": "main", "index": 0 }]]
+    },
+    "Validation Agent — Schema & Confidence Checks": {
+      "main": [[
+        { "node": "Route: HITL or Proceed?", "type": "main", "index": 0 },
+        { "node": "CloudTrail + GuardDuty Audit Log", "type": "main", "index": 0 }
+      ]]
+    },
+    "Route: HITL or Proceed?": {
+      "main": [
+        [{ "node": "HITL Review Queue — Human in the Loop", "type": "main", "index": 0 }],
+        [{ "node": "Routing Agent — Destination Selection", "type": "main", "index": 0 }]
+      ]
+    },
+    "HITL Review Queue — Human in the Loop": {
+      "main": [[{ "node": "Wait for Human Approval", "type": "main", "index": 0 }]]
+    },
+    "Wait for Human Approval": {
+      "main": [[{ "node": "Routing Agent — Destination Selection", "type": "main", "index": 0 }]]
+    },
+    "Routing Agent — Destination Selection": {
+      "main": [[{ "node": "Bronze Zone — Raw Structured JSON", "type": "main", "index": 0 }]]
+    },
+    "Bronze Zone — Raw Structured JSON": {
+      "main": [[{ "node": "Silver Zone — Cleansed & Deduplicated", "type": "main", "index": 0 }]]
+    },
+    "Silver Zone — Cleansed & Deduplicated": {
+      "main": [[{ "node": "Gold Zone — Business Aggregates", "type": "main", "index": 0 }]]
+    },
+    "Gold Zone — Business Aggregates": {
+      "main": [[
+        { "node": "Aurora RDS — Operational Store for Underwriters", "type": "main", "index": 0 },
+        { "node": "Redshift Serverless — BI & Executive Queries", "type": "main", "index": 0 },
+        { "node": "ElasticSearch — Full-Text Document Search", "type": "main", "index": 0 },
+        { "node": "SageMaker Feature Store", "type": "main", "index": 0 }
+      ]]
+    },
+    "Aurora RDS — Operational Store for Underwriters": {
+      "main": [[
+        { "node": "QuickSight — Executive Dashboards", "type": "main", "index": 0 },
+        { "node": "Underwriter Portal — React + API Gateway", "type": "main", "index": 0 }
+      ]]
+    },
+    "Redshift Serverless — BI & Executive Queries": {
+      "main": [[{ "node": "QuickSight — Executive Dashboards", "type": "main", "index": 0 }]]
+    },
+    "ElasticSearch — Full-Text Document Search": {
+      "main": [[{ "node": "Underwriter Portal — React + API Gateway", "type": "main", "index": 0 }]]
+    },
+    "SageMaker Feature Store": {
+      "main": [[
+        { "node": "Training Pipeline — Churn, Credit Risk, Recommendations", "type": "main", "index": 0 },
+        { "node": "Inference Endpoints — A/B Deployed", "type": "main", "index": 0 }
+      ]]
+    },
+    "Inference Endpoints — A/B Deployed": {
+      "main": [[{ "node": "Personalisation Engine — Product Recommendations", "type": "main", "index": 0 }]]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "error-handler"
+  },
+  "staticData": null,
+  "tags": [
+    { "name": "finance" },
+    { "name": "document-processing" },
+    { "name": "multi-agent" },
+    { "name": "aws" }
+  ],
+  "triggerCount": 1,
+  "updatedAt": "2026-06-22T00:00:00.000Z",
+  "versionId": "1"
+}
